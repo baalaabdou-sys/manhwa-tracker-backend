@@ -297,6 +297,36 @@ class SubscriptionRequest(BaseModel):
     subscription: dict
 
 
+@app.get("/api/debug-browse")
+def debug_browse():
+    """Temporary debug endpoint - shows raw structure info from /browse page."""
+    try:
+        r = requests.get(f"{SITE_URL}/browse", headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        h3_count = len(soup.find_all("h3"))
+        h2_count = len(soup.find_all("h2"))
+        comic_links = soup.select('a[href*="/comics/"]')
+
+        sample_h3 = str(soup.find_all("h3")[:3])
+        sample_links = [
+            {"href": l.get("href"), "text": l.get_text(strip=True)[:60]}
+            for l in comic_links[:10]
+        ]
+
+        return {
+            "status_code": r.status_code,
+            "html_length": len(r.text),
+            "h3_count": h3_count,
+            "h2_count": h2_count,
+            "comic_link_count": len(comic_links),
+            "sample_h3_html": sample_h3,
+            "sample_links": sample_links,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "manhwa-tracker-backend"}
