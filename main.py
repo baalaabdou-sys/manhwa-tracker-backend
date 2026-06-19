@@ -91,6 +91,8 @@ def search_manhwa(query: str):
 
     Note: the site's /browse?name= filter is client-side JS only, so we fetch
     the full browse listing and filter server-side by title text instead.
+    Each comic card is an <a href="/comics/..."> wrapping an <h3> with the title
+    (and a separate rating-only link with the same href).
     """
     url = f"{SITE_URL}/browse"
     r = requests.get(url, headers=HEADERS, timeout=15)
@@ -100,19 +102,21 @@ def search_manhwa(query: str):
     results = []
     seen_ids = set()
 
-    # Titles live in <h3><a href="/comics/...">Title</a></h3> blocks
-    for h in soup.find_all(["h3", "h2"]):
-        link = h.find("a", href=lambda hh: hh and "/comics/" in hh and "/chapter/" not in hh)
-        if not link:
+    for link in soup.select('a[href*="/comics/"]'):
+        href = link.get("href", "")
+        if "/chapter/" in href:
             continue
 
-        href = link.get("href", "")
+        h3 = link.find("h3")
+        if not h3:
+            continue  # this is the rating-only link variant, skip it
+
         comic_id = href.replace("/comics/", "").strip("/")
         if comic_id in seen_ids:
             continue
         seen_ids.add(comic_id)
 
-        title = link.get_text(strip=True)
+        title = h3.get_text(strip=True)
         if not title:
             continue
 
@@ -295,6 +299,43 @@ class FavoriteRequest(BaseModel):
 class SubscriptionRequest(BaseModel):
     user_id: str
     subscription: dict
+
+
+@app.get("/api/debug-homepage")
+def debug_homepage():
+    """Temporary debug endpoint - shows raw structure info from homepage."""
+    try:
+        r = requests.get(SITE_URL + "/", headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        comic_links = soup.select('a[href*="/comics/"]')
+        sample_links = []
+        for l in comic_links[:15]:
+            h3 = l.find("h3")
+            img = l.find("img")
+            sample_links.append({
+                "href": l.get("href"),
+                "text": l.get_text(strip=True)[:50],
+                "has_h3": bool(h3),
+                "has_img": bool(img),
+                "img_src": img.get("src") if img else None,
+            })
+
+        chapter_links = soup.select('a[href*="/chapter/"]')
+        sample_chapters = [
+            {"href": l.get("href"), "text": l.get_text(strip=True)[:50]}
+            for l in chapter_links[:6]
+        ]
+
+        return {
+            "status_code": r.status_code,
+            "comic_link_count": len(comic_links),
+            "chapter_link_count": len(chapter_links),
+            "sample_links": sample_links,
+            "sample_chapters": sample_chapters,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/debug-browse")
