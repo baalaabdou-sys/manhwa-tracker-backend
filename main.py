@@ -65,42 +65,78 @@ def save_json(path, data):
 # Scraping functions
 # ─────────────────────────────────────────
 
+def get_cover_map():
+    """Scrape homepage to build a {comic_id: cover_url} map (covers aren't on /browse)."""
+    r = requests.get(SITE_URL + "/", headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    cover_map = {}
+    for link in soup.select('a[href*="/comics/"]'):
+        href = link.get("href", "")
+        if "/chapter/" in href:
+            continue
+        img = link.find("img")
+        if img and img.get("src"):
+            comic_id = href.replace("/comics/", "").strip("/")
+            cover = img["src"]
+            if not cover.startswith("http"):
+                cover = SITE_URL + cover
+            cover_map[comic_id] = cover
+    return cover_map
+
+
 def search_manhwa(query: str):
-    """Search AsuraScans for manhwa matching the query."""
+    """Search AsuraScans for manhwa matching the query.
+
+    Note: the site's /browse?name= filter is client-side JS only, so we fetch
+    the full browse listing and filter server-side by title text instead.
+    """
     url = f"{SITE_URL}/browse"
-    params = {"name": query} if query else {}
-    r = requests.get(url, headers=HEADERS, params=params, timeout=15)
+    r = requests.get(url, headers=HEADERS, timeout=15)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
     results = []
-    seen_urls = set()
+    seen_ids = set()
 
-    for link in soup.select('a[href*="/comics/"]'):
-        href = link.get("href", "")
-        if "/chapter/" in href or href in seen_urls:
+    # Titles live in <h3><a href="/comics/...">Title</a></h3> blocks
+    for h in soup.find_all(["h3", "h2"]):
+        link = h.find("a", href=lambda hh: hh and "/comics/" in hh and "/chapter/" not in hh)
+        if not link:
             continue
 
-        img = link.find("img")
-        title = link.get_text(strip=True) or (img.get("alt") if img else "")
+        href = link.get("href", "")
+        comic_id = href.replace("/comics/", "").strip("/")
+        if comic_id in seen_ids:
+            continue
+        seen_ids.add(comic_id)
+
+        title = link.get_text(strip=True)
         if not title:
             continue
 
-        seen_urls.add(href)
         full_url = href if href.startswith("http") else SITE_URL + href
-        cover = img.get("src") if img else None
-        if cover and not cover.startswith("http"):
-            cover = SITE_URL + cover
 
         results.append({
-            "id": href.replace("/comics/", "").strip("/"),
+            "id": comic_id,
             "title": title,
             "url": full_url,
-            "cover": cover,
+            "cover": None,  # filled in below
         })
 
     if query:
-        results = [r for r in results if query.lower() in r["title"].lower()]
+        q = query.lower()
+        results = [r for r in results if q in r["title"].lower()]
+
+    # Attach covers from homepage where available (best-effort, won't cover everything)
+    try:
+        cover_map = get_cover_map()
+        for r in results:
+            r["cover"] = cover_map.get(r["id"])
+    except Exception:
+        pass
+
 
     return results[:30]
 
