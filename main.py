@@ -65,24 +65,44 @@ def save_json(path, data):
 # Scraping functions
 # ─────────────────────────────────────────
 
+def _extract_comic_card(link):
+    """Given an <a href='/comics/...'> tag, extract id/title/cover if it's a
+    full card (has both <h3> title and <img> cover). Returns None otherwise
+    (e.g. the separate rating-only link variant for the same comic)."""
+    href = link.get("href", "")
+    if "/chapter/" in href:
+        return None
+    h3 = link.find("h3")
+    if not h3:
+        return None
+    title = h3.get_text(strip=True)
+    if not title:
+        return None
+
+    comic_id = href.replace("/comics/", "").strip("/")
+    full_url = href if href.startswith("http") else SITE_URL + href
+
+    img = link.find("img")
+    cover = None
+    if img:
+        cover = img.get("src") or img.get("data-src")
+        if cover and not cover.startswith("http"):
+            cover = SITE_URL + cover
+
+    return {"id": comic_id, "title": title, "url": full_url, "cover": cover}
+
+
 def get_cover_map():
-    """Scrape homepage to build a {comic_id: cover_url} map (covers aren't on /browse)."""
+    """Scrape homepage to build a {comic_id: cover_url} map."""
     r = requests.get(SITE_URL + "/", headers=HEADERS, timeout=15)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
     cover_map = {}
     for link in soup.select('a[href*="/comics/"]'):
-        href = link.get("href", "")
-        if "/chapter/" in href:
-            continue
-        img = link.find("img")
-        if img and img.get("src"):
-            comic_id = href.replace("/comics/", "").strip("/")
-            cover = img["src"]
-            if not cover.startswith("http"):
-                cover = SITE_URL + cover
-            cover_map[comic_id] = cover
+        card = _extract_comic_card(link)
+        if card and card["cover"]:
+            cover_map[card["id"]] = card["cover"]
     return cover_map
 
 
@@ -91,8 +111,8 @@ def search_manhwa(query: str):
 
     Note: the site's /browse?name= filter is client-side JS only, so we fetch
     the full browse listing and filter server-side by title text instead.
-    Each comic card is an <a href="/comics/..."> wrapping an <h3> with the title
-    (and a separate rating-only link with the same href).
+    Each comic has two links sharing the same href: a rating-only link and a
+    card link wrapping both <h3> (title) and <img> (cover) - we only want the card link.
     """
     url = f"{SITE_URL}/browse"
     r = requests.get(url, headers=HEADERS, timeout=15)
@@ -103,44 +123,15 @@ def search_manhwa(query: str):
     seen_ids = set()
 
     for link in soup.select('a[href*="/comics/"]'):
-        href = link.get("href", "")
-        if "/chapter/" in href:
+        card = _extract_comic_card(link)
+        if not card or card["id"] in seen_ids:
             continue
-
-        h3 = link.find("h3")
-        if not h3:
-            continue  # this is the rating-only link variant, skip it
-
-        comic_id = href.replace("/comics/", "").strip("/")
-        if comic_id in seen_ids:
-            continue
-        seen_ids.add(comic_id)
-
-        title = h3.get_text(strip=True)
-        if not title:
-            continue
-
-        full_url = href if href.startswith("http") else SITE_URL + href
-
-        results.append({
-            "id": comic_id,
-            "title": title,
-            "url": full_url,
-            "cover": None,  # filled in below
-        })
+        seen_ids.add(card["id"])
+        results.append(card)
 
     if query:
         q = query.lower()
         results = [r for r in results if q in r["title"].lower()]
-
-    # Attach covers from homepage where available (best-effort, won't cover everything)
-    try:
-        cover_map = get_cover_map()
-        for r in results:
-            r["cover"] = cover_map.get(r["id"])
-    except Exception:
-        pass
-
 
     return results[:30]
 
@@ -164,35 +155,54 @@ def get_latest_chapter(comic_url: str):
 
 
 def get_homepage_latest_updates():
-    """Scrape homepage 'Latest Updates' - faster than checking each comic page."""
+    """Scrape homepage 'Latest Updates' section only (ignores the trending/rated
+    carousel at the top, which has no real per-comic chapter pairing).
+
+    Strategy: find each chapter link, then look at its closest preceding
+    sibling/ancestor card that has BOTH an <h3> title and an <img> cover -
+    this card/chapter pair pattern only holds true inside the real
+    'Latest Updates' grid, not the trending carousel.
+    """
     r = requests.get(SITE_URL + "/", headers=HEADERS, timeout=15)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
     updates = {}
-    seen_slugs = set()
 
-    for link in soup.select('a[href*="/comics/"]'):
-        href = link.get("href", "")
-        if "/chapter/" in href or href in seen_slugs:
-            continue
-        title_text = link.get_text(strip=True)
-        if not title_text:
-            continue
-        seen_slugs.add(href)
+    for chapter_link in soup.select('a[href*="/chapter/"]'):
+        href = chapter_link.get("href", "")
+        comic_part = href.split("/chapter/")[0]
+        comic_id = comic_part.replace("/comics/", "").strip("/")
 
-        comic_id = href.replace("/comics/", "").strip("/")
-        parent = link.find_parent()
-        chapter_link = parent.find_next("a", href=lambda h: h and "/chapter/" in h) if parent else None
+        if comic_id in updates:
+            continue  # keep first occurrence = newest chapter for this comic
 
-        if chapter_link:
-            updates[comic_id] = {
-                "title": title_text,
-                "chapter": chapter_link.get_text(strip=True),
-                "url": chapter_link.get("href", ""),
-            }
+        # Walk up to a reasonable container and look for the matching comic card within it
+        container = chapter_link
+        card = None
+        for _ in range(5):  # limit how far up we search
+            container = container.find_parent()
+            if container is None:
+                break
+            candidate = container.find(
+                "a", href=lambda h: h and comic_part in h and "/chapter/" not in h
+            )
+            if candidate:
+                card = _extract_comic_card(candidate)
+                if card:
+                    break
+
+        chapter_url = href if href.startswith("http") else SITE_URL + href
+        updates[comic_id] = {
+            "title": card["title"] if card else comic_id.replace("-", " ").title(),
+            "cover": card["cover"] if card else None,
+            "chapter": chapter_link.get_text(strip=True),
+            "url": chapter_url,
+        }
 
     return updates
+
+
 
 
 # ─────────────────────────────────────────
